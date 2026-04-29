@@ -6,3 +6,4 @@ anthropic
 python-dotenv
 pandas
 scikit-learn
+openpyxl
