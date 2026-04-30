@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
@@ -8,8 +9,8 @@ import os
 import anthropic
 import joblib
 import json
+import math
 import plotly.express as px
-import plotly.graph_objects as go
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -29,6 +30,32 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+def safe_value(v):
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+def clean_dict(obj):
+    if isinstance(obj, dict):
+        return {k: clean_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_dict(v) for v in obj]
+    elif isinstance(obj, float):
+        return safe_value(obj)
+    elif isinstance(obj, np.floating):
+        v = float(obj)
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return clean_dict(obj.tolist())
+    return obj
+
+def make_response(data):
+    return JSONResponse(content=json.loads(
+        json.dumps(clean_dict(data), allow_nan=False, default=str)
+    ))
 
 @app.get("/")
 def read_root():
@@ -56,13 +83,16 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    return {
+    df_clean = df.where(pd.notnull(df), None)
+    preview = df_clean.head(5).to_dict(orient="records")
+
+    return make_response({
         "filename": filename,
         "rows": len(df),
         "columns": list(df.columns),
         "dtypes": df.dtypes.astype(str).to_dict(),
-        "preview": df.head(5).to_dict(orient="records")
-    }
+        "preview": preview
+    })
 
 @app.post("/analyze")
 async def analyze_file(file: UploadFile = File(...)):
@@ -82,8 +112,8 @@ async def analyze_file(file: UploadFile = File(...)):
         "rows": len(df),
         "columns": list(df.columns),
         "dtypes": df.dtypes.astype(str).to_dict(),
-        "missing_values": df.isnull().sum().to_dict(),
-        "statistics": df.describe().to_dict()
+        "missing_values": {k: int(v) for k, v in df.isnull().sum().to_dict().items()},
+        "statistics": df.describe().where(pd.notnull(df.describe()), None).to_dict()
     }
 
     prompt = f"""You are an expert data scientist. Analyze the following dataset and provide useful insights in English:
@@ -109,11 +139,11 @@ Please provide a thorough analysis covering:
         messages=[{"role": "user", "content": prompt}]
     )
 
-    return {
+    return make_response({
         "filename": filename,
         "summary": summary,
         "ai_analysis": message.content[0].text
-    }
+    })
 
 class TrainRequest(BaseModel):
     filename: str
@@ -142,7 +172,6 @@ async def train_model(request: TrainRequest):
 
     X = df.drop(columns=[request.target_column])
     y = df[request.target_column]
-
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     if request.task_type == "classification":
@@ -160,18 +189,18 @@ async def train_model(request: TrainRequest):
 
     feature_importance = {}
     if hasattr(model, "feature_importances_"):
-        feature_importance = dict(zip(X.columns, model.feature_importances_.tolist()))
+        feature_importance = dict(zip(X.columns.tolist(), [float(v) for v in model.feature_importances_]))
 
-    return {
+    return make_response({
         "model_type": request.model_type,
         "task_type": request.task_type,
         "target_column": request.target_column,
         "train_size": len(X_train),
         "test_size": len(X_test),
         "metric_name": metric_name,
-        "score": round(score, 4),
+        "score": round(float(score), 4),
         "feature_importance": feature_importance
-    }
+    })
 
 class VizRequest(BaseModel):
     filename: str
@@ -216,7 +245,7 @@ async def visualize_data(request: VizRequest):
             raise HTTPException(status_code=400, detail="Unsupported chart type!")
 
         fig.update_layout(template="plotly_white")
-        return json.loads(fig.to_json())
+        return JSONResponse(content=json.loads(fig.to_json()))
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
