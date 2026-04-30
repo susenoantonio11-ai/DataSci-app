@@ -7,11 +7,14 @@ import io
 import os
 import anthropic
 import joblib
+import json
+import plotly.express as px
+import plotly.graph_objects as go
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.metrics import accuracy_score, r2_score, mean_squared_error
+from sklearn.metrics import accuracy_score, r2_score
 
 app = FastAPI(title="DataSci App API")
 
@@ -26,8 +29,6 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-datasets = {}
 
 @app.get("/")
 def read_root():
@@ -55,12 +56,11 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    datasets[filename] = df
-
     return {
         "filename": filename,
         "rows": len(df),
         "columns": list(df.columns),
+        "dtypes": df.dtypes.astype(str).to_dict(),
         "preview": df.head(5).to_dict(orient="records")
     }
 
@@ -74,7 +74,7 @@ async def analyze_file(file: UploadFile = File(...)):
         elif filename.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(contents))
         else:
-            raise HTTPException(status_code=400, detail="Unsupported format. Please use CSV or XLSX!")
+            raise HTTPException(status_code=400, detail="Unsupported format!")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -136,7 +136,6 @@ async def train_model(request: TrainRequest):
         raise HTTPException(status_code=400, detail=f"Column '{request.target_column}' not found!")
 
     df = df.dropna()
-
     le = LabelEncoder()
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = le.fit_transform(df[col].astype(str))
@@ -147,26 +146,17 @@ async def train_model(request: TrainRequest):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     if request.task_type == "classification":
-        if request.model_type == "random_forest":
-            model = RandomForestClassifier(n_estimators=100, random_state=42)
-        else:
-            model = LogisticRegression(max_iter=1000)
+        model = RandomForestClassifier(n_estimators=100, random_state=42) if request.model_type == "random_forest" else LogisticRegression(max_iter=1000)
         model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        score = accuracy_score(y_test, y_pred)
+        score = accuracy_score(y_test, model.predict(X_test))
         metric_name = "Accuracy"
     else:
-        if request.model_type == "random_forest":
-            model = RandomForestRegressor(n_estimators=100, random_state=42)
-        else:
-            model = LinearRegression()
+        model = RandomForestRegressor(n_estimators=100, random_state=42) if request.model_type == "random_forest" else LinearRegression()
         model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        score = r2_score(y_test, y_pred)
+        score = r2_score(y_test, model.predict(X_test))
         metric_name = "R2 Score"
 
-    model_path = os.path.join(UPLOAD_DIR, f"model_{request.filename}.pkl")
-    joblib.dump(model, model_path)
+    joblib.dump(model, os.path.join(UPLOAD_DIR, f"model_{request.filename}.pkl"))
 
     feature_importance = {}
     if hasattr(model, "feature_importances_"):
@@ -182,3 +172,51 @@ async def train_model(request: TrainRequest):
         "score": round(score, 4),
         "feature_importance": feature_importance
     }
+
+class VizRequest(BaseModel):
+    filename: str
+    chart_type: str
+    x_column: str
+    y_column: str = None
+    color_column: str = None
+
+@app.post("/visualize")
+async def visualize_data(request: VizRequest):
+    file_path = os.path.join(UPLOAD_DIR, request.filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found. Please upload the file first!")
+
+    if request.filename.endswith(".csv"):
+        df = pd.read_csv(file_path)
+    else:
+        df = pd.read_excel(file_path)
+
+    try:
+        if request.chart_type == "histogram":
+            fig = px.histogram(df, x=request.x_column, color=request.color_column,
+                             title=f"Histogram of {request.x_column}")
+        elif request.chart_type == "scatter":
+            fig = px.scatter(df, x=request.x_column, y=request.y_column,
+                           color=request.color_column,
+                           title=f"{request.x_column} vs {request.y_column}")
+        elif request.chart_type == "bar":
+            fig = px.bar(df, x=request.x_column, y=request.y_column,
+                        color=request.color_column,
+                        title=f"Bar Chart: {request.x_column}")
+        elif request.chart_type == "box":
+            fig = px.box(df, x=request.x_column, y=request.y_column,
+                        color=request.color_column,
+                        title=f"Box Plot of {request.x_column}")
+        elif request.chart_type == "correlation":
+            numeric_df = df.select_dtypes(include=[np.number])
+            corr = numeric_df.corr()
+            fig = px.imshow(corr, text_auto=True, title="Correlation Heatmap",
+                          color_continuous_scale="RdBu_r")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported chart type!")
+
+        fig.update_layout(template="plotly_white")
+        return json.loads(fig.to_json())
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
