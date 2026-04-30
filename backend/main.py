@@ -249,3 +249,67 @@ async def visualize_data(request: VizRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/clean")
+async def clean_data(file: UploadFile = File(...)):
+    filename = file.filename
+    contents = await file.read()
+    try:
+        if filename.endswith(".csv"):
+            df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
+        elif filename.endswith(".xlsx"):
+            df = pd.read_excel(io.BytesIO(contents))
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported format!")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    rows_before = len(df)
+    missing_before = int(df.isnull().sum().sum())
+    duplicates = int(df.duplicated().sum())
+
+    df = df.drop_duplicates()
+    df = df.fillna(df.median(numeric_only=True))
+    df = df.fillna("Unknown")
+
+    rows_after = len(df)
+    missing_after = int(df.isnull().sum().sum())
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    outliers_detected = 0
+    for col in numeric_cols:
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        outliers = ((df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR))).sum()
+        outliers_detected += int(outliers)
+
+    prompt = f"""You are a data cleaning expert. Summarize the cleaning results in English:
+
+Before cleaning:
+- Rows: {rows_before}
+- Missing values: {missing_before}
+- Duplicates: {duplicates}
+
+After cleaning:
+- Rows: {rows_after}
+- Missing values fixed: {missing_before - missing_after}
+- Duplicates removed: {duplicates}
+- Outliers detected: {outliers_detected}
+
+Provide a brief summary of what was done and recommendations."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return make_response({
+        "rows_before": rows_before,
+        "rows_after": rows_after,
+        "missing_fixed": missing_before - missing_after,
+        "duplicates_removed": duplicates,
+        "outliers_detected": outliers_detected,
+        "ai_summary": message.content[0].text
+    })
